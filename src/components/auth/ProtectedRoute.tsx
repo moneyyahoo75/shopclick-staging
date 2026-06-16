@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
+import { useAdmin } from '../../contexts/AdminContext';
 import { sessionUtils } from '../../utils/sessionUtils';
 import { supabase } from '../../lib/supabase';
 
@@ -18,6 +19,7 @@ const ProtectedRoute: React.FC<ProtectedRouteProps> = ({
                                                          requiresSubscription = true
                                                        }) => {
   const { user, loading, checkVerificationStatus } = useAuth();
+  const { settings } = useAdmin();
   const location = useLocation();
   const navigate = useNavigate();
   const [isChecking, setIsChecking] = useState(true);
@@ -28,23 +30,25 @@ const ProtectedRoute: React.FC<ProtectedRouteProps> = ({
   } | null>(null);
 
   useEffect(() => {
-    // Additional session check when route changes
+    // Skip the expensive live session + verification check while auth context is still loading,
+    // or when we already have a user (saves a round-trip and prevents isChecking=true flicker
+    // that can interrupt in-progress payment flows).
+    if (loading) {
+      // Auth context is still initialising — wait for it.
+      return;
+    }
+
     const checkSession = async () => {
       setIsChecking(true);
 
       try {
-        // Wait a bit for auth context to initialize
-        await new Promise(resolve => setTimeout(resolve, 100));
-
         const sessionInfo = sessionUtils.getSessionInfo();
-        let liveSession = null;
 
         if (sessionInfo.isValid) {
           setHasValidSession(true);
-        }
-
-        if (!sessionInfo.isValid && !loading) {
-          console.log('🔍 Cached session is invalid, checking live Supabase session');
+        } else if (!user) {
+          // Only do the expensive live check when we have no cached session AND no user.
+          console.log('🔍 Cached session is invalid and no user, checking live Supabase session');
           try {
             const sessionResult = await Promise.race([
               supabase.auth.getSession(),
@@ -53,7 +57,7 @@ const ProtectedRoute: React.FC<ProtectedRouteProps> = ({
               })
             ]);
 
-            liveSession = sessionResult.data.session;
+            let liveSession = sessionResult.data.session;
 
             if (!liveSession) {
               console.log('🔄 No live session, attempting restore');
@@ -70,10 +74,26 @@ const ProtectedRoute: React.FC<ProtectedRouteProps> = ({
             console.error('❌ Live session check failed in ProtectedRoute:', error);
             setHasValidSession(false);
           }
+        } else {
+          // We have a user — trust that the session is valid without a round-trip.
+          setHasValidSession(true);
         }
 
-        // If user exists and verification is required, check verification status
-        if (user && requiresVerification) {
+        // Only check verification status when required AND user exists.
+        // Skip for pages that are always accessible without subscription (e.g. /registration-payment)
+        // to avoid blocking payment flows with an extra network call.
+        const skipVerificationPages = [
+          '/registration-payment',
+          '/registration-payment-success',
+          '/payment',
+          '/subscription-plans',
+          '/verify-otp',
+        ];
+        const isSkipPage = skipVerificationPages.some(
+          p => location.pathname === p || location.pathname.startsWith(p)
+        );
+
+        if (user && requiresVerification && !isSkipPage) {
           console.log('🔍 Checking verification status for user:', user.id);
           const status = await Promise.race([
             checkVerificationStatus(user.id),
@@ -188,8 +208,10 @@ const ProtectedRoute: React.FC<ProtectedRouteProps> = ({
     }
   }
 
-  // Check if user has active subscription (mandatory for all authenticated pages except specific pages)
-  if (requiresSubscription && user.userType !== 'admin' && !user.hasActiveSubscription) {
+  const hasCustomerAccess = user.hasActiveSubscription || Boolean((user as any).registrationPaid);
+
+  // Check if user has paid access (mandatory for all authenticated pages except specific pages)
+  if (requiresSubscription && user.userType !== 'admin' && !hasCustomerAccess) {
     // Allow access to specific pages without subscription
     const allowedWithoutSubscription = [
       '/payment',
@@ -205,9 +227,11 @@ const ProtectedRoute: React.FC<ProtectedRouteProps> = ({
 
     if (!isAllowedPage) {
       console.log('🔒 No active subscription, redirecting to subscription plans');
+      const launchPhase = (settings?.launchPhase || 'prelaunch') as 'prelaunch' | 'launched';
+      const customerDestination = launchPhase === 'launched' ? '/subscription-plans' : '/registration-payment';
       return (
           <Navigate
-              to={user.userType === 'customer' ? '/registration-payment' : '/subscription-plans'}
+              to={user.userType === 'customer' ? customerDestination : '/subscription-plans'}
               replace
               state={{
                 from: location,

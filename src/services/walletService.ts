@@ -47,6 +47,8 @@ const DISTRIBUTION_ABI = [
   'event PaymentDistributed(address indexed sender, uint256 totalAmount, uint256 recipientCount)'
 ];
 
+const ERC20_TRANSFER_TOPIC = ethers.id('Transfer(address,address,uint256)');
+
 // Admin Settings Interface
 interface AdminSettings {
   paymentMode: string | number | boolean;
@@ -167,6 +169,11 @@ export class WalletService {
   private buildRpcUnavailableMessage(): string {
     const networkConfig = this.getNetworkConfig();
     return `${networkConfig.chainName} RPC is not responding in your wallet. Please update the network RPC URL in MetaMask and reconnect.`;
+  }
+
+  private getReadonlyProvider(): ethers.JsonRpcProvider {
+    const networkConfig = this.getNetworkConfig();
+    return new ethers.JsonRpcProvider(networkConfig.rpcUrls[0]);
   }
 
   private isRpcFetchError(error: any): boolean {
@@ -618,7 +625,7 @@ export class WalletService {
 
   // Direct USDT transfer to admin wallet (registration payments)
   async sendUSDTTransfer(toAddress: string, amount: number): Promise<{ hash: string; steps: string[] }> {
-    if (!this.signer || !this.provider) {
+    if (!this.provider || !this.externalProvider) {
       throw new Error('Wallet not connected');
     }
 
@@ -631,6 +638,16 @@ export class WalletService {
     }
 
     const steps: string[] = [];
+
+    // Refresh signer — on Android MetaMask the signer can become stale after app-switching
+    try {
+      this.provider = new ethers.BrowserProvider(this.externalProvider);
+      this.signer = await this.provider.getSigner();
+    } catch {
+      // If refresh fails, fall back to existing signer
+      if (!this.signer) throw new Error('Wallet not connected');
+    }
+
     const signerAddress = await this.signer.getAddress();
 
     await this.assertCorrectNetwork();
@@ -675,6 +692,66 @@ export class WalletService {
     }
   }
 
+  async getCurrentBlockNumber(): Promise<number> {
+    return this.getReadonlyProvider().getBlockNumber();
+  }
+
+  async findRecentUSDTTransfer(
+    fromAddress: string,
+    toAddress: string,
+    amount: number,
+    fromBlock?: number | null
+  ): Promise<string | null> {
+    if (!ethers.isAddress(fromAddress) || !ethers.isAddress(toAddress)) {
+      throw new Error('Invalid wallet address');
+    }
+
+    const usdtContractAddress = this.getUSDTContractAddress();
+    const readonlyProvider = this.getReadonlyProvider();
+    const tokenContract = new ethers.Contract(
+      usdtContractAddress,
+      ['function decimals() view returns (uint8)'],
+      readonlyProvider
+    );
+
+    let decimals = 18;
+    try {
+      decimals = Number(await tokenContract.decimals());
+    } catch {
+      // ignore: most configured USDT contracts in this app use 18 decimals.
+    }
+
+    const currentBlock = await readonlyProvider.getBlockNumber();
+    const startBlock = Math.max(0, Number.isFinite(Number(fromBlock)) ? Number(fromBlock) - 20 : currentBlock - 3000);
+    const expectedAmount = ethers.parseUnits(amount.toString(), decimals);
+
+    const logs = await readonlyProvider.getLogs({
+      address: usdtContractAddress,
+      fromBlock: startBlock,
+      toBlock: currentBlock,
+      topics: [
+        ERC20_TRANSFER_TOPIC,
+        ethers.zeroPadValue(ethers.getAddress(fromAddress), 32),
+        ethers.zeroPadValue(ethers.getAddress(toAddress), 32)
+      ]
+    });
+
+    const matchingLogs = logs
+      .filter((log) => {
+        try {
+          return BigInt(log.data) === expectedAmount;
+        } catch {
+          return false;
+        }
+      })
+      .sort((a, b) => {
+        if (a.blockNumber !== b.blockNumber) return b.blockNumber - a.blockNumber;
+        return b.index - a.index;
+      });
+
+    return matchingLogs[0]?.transactionHash || null;
+  }
+
   async watchUSDTToken(): Promise<boolean> {
     if (!this.provider) {
       throw new Error('Wallet not connected');
@@ -708,19 +785,47 @@ export class WalletService {
       // ignore (fallback to USDT)
     }
 
-    const result = await this.externalProvider.request({
-      method: 'wallet_watchAsset',
-      params: {
-        type: 'ERC20',
-        options: {
-          address: tokenAddress,
-          symbol,
-          decimals
+    const watchAssetParams = {
+      type: 'ERC20',
+      options: {
+        address: tokenAddress,
+        symbol,
+        decimals
+      }
+    };
+
+    const attempts = [
+      watchAssetParams,
+      [watchAssetParams],
+      JSON.stringify(watchAssetParams),
+      JSON.stringify([watchAssetParams])
+    ];
+
+    let lastError: any = null;
+    for (const params of attempts) {
+      try {
+        const result = await this.externalProvider.request({
+          method: 'wallet_watchAsset',
+          params
+        });
+        return Boolean(result);
+      } catch (error: any) {
+        lastError = error;
+        const message = String(error?.message || error || '').toLowerCase();
+        const isParamShapeError =
+          message.includes('json') ||
+          message.includes('object') ||
+          message.includes('array') ||
+          message.includes('invalid params') ||
+          error?.code === -32602;
+
+        if (!isParamShapeError || error?.code === 4001) {
+          throw error;
         }
       }
-    });
+    }
 
-    return Boolean(result);
+    throw lastError || new Error('Unable to add token');
   }
 
   // Disconnect wallet

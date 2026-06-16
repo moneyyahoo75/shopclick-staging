@@ -91,6 +91,7 @@ const processTransfer = async (params: {
   amount: number;
   netAmount: number;
   destinationAddress: string;
+  walletType: 'working' | 'non_working';
   adminPaymentWallet: string;
   usdtAddress: string;
   paymentMode: any;
@@ -102,6 +103,7 @@ const processTransfer = async (params: {
     amount,
     netAmount,
     destinationAddress,
+    walletType,
     adminPaymentWallet,
     usdtAddress,
     paymentMode
@@ -112,6 +114,7 @@ const processTransfer = async (params: {
     .select('tw_id, tw_balance')
     .eq('tw_user_id', userId)
     .eq('tw_currency', 'USDT')
+    .eq('tw_wallet_type', walletType)
     .maybeSingle();
 
   if (walletError || !wallet) {
@@ -176,6 +179,7 @@ const processTransfer = async (params: {
     throw new Error('Admin private key does not match configured payment wallet');
   }
 
+  let submittedTxHash: string | null = null;
   try {
     const token = new ethers.Contract(usdtAddress, USDT_ABI, signer);
     const decimals = await token.decimals();
@@ -199,6 +203,15 @@ const processTransfer = async (params: {
     }
 
     const tx = await token.transfer(destinationAddress, amountUnits);
+    submittedTxHash = tx.hash;
+
+    await supabase
+      .from('tbl_wallet_transactions')
+      .update({
+        twt_blockchain_hash: tx.hash
+      })
+      .eq('twt_id', walletTx.twt_id);
+
     await tx.wait(MIN_CONFIRMATIONS_DEFAULT);
 
     const { error: txUpdateError } = await supabase
@@ -216,6 +229,33 @@ const processTransfer = async (params: {
     return tx.hash as string;
   } catch (error: any) {
     const failureReason = formatWithdrawalFailureReason(error);
+
+    if (submittedTxHash) {
+      await supabase
+        .from('tbl_wallet_transactions')
+        .update({
+          twt_status: 'pending',
+          twt_blockchain_hash: submittedTxHash
+        })
+        .eq('twt_id', walletTx.twt_id);
+
+      await supabase
+        .from('tbl_withdrawal_requests')
+        .update({
+          twr_status: 'processing',
+          twr_failure_reason: 'Transfer submitted on-chain but confirmation is pending. Admin must verify the transaction before retrying or failing.',
+          twr_admin_debug: `${formatWithdrawalAdminDebug(error)} | submitted_tx=${submittedTxHash}`,
+          twr_blockchain_tx: submittedTxHash,
+          twr_processed_at: new Date().toISOString()
+        })
+        .eq('twr_id', requestId);
+
+      const pendingError = new Error(`Withdrawal transfer submitted but confirmation is pending: ${submittedTxHash}`);
+      (pendingError as any).status = 'submitted_pending_confirmation';
+      (pendingError as any).txHash = submittedTxHash;
+      throw pendingError;
+    }
+
     await supabase
       .from('tbl_wallet_transactions')
       .update({ twt_status: 'failed' })
@@ -275,6 +315,8 @@ Deno.serve(async (req: Request) => {
     const body = await req.json();
     const amountUnits = toUnits6(body?.amount);
     const withdrawalAmount = Number(body?.amount);
+    const walletTypeRaw = String(body?.walletType || body?.wallet_type || 'working').trim().toLowerCase();
+    const walletType: 'working' | 'non_working' = walletTypeRaw === 'non_working' ? 'non_working' : 'working';
 
     if (amountUnits === null || !Number.isFinite(withdrawalAmount) || withdrawalAmount <= 0) {
       return new Response(JSON.stringify({ success: false, error: 'Invalid withdrawal amount' }), {
@@ -374,9 +416,10 @@ Deno.serve(async (req: Request) => {
 
     const { data: wallet, error: walletError } = await supabase
       .from('tbl_wallets')
-      .select('tw_id, tw_balance')
+      .select('tw_id, tw_balance, tw_reserved_balance')
       .eq('tw_user_id', userId)
       .eq('tw_currency', 'USDT')
+      .eq('tw_wallet_type', walletType)
       .maybeSingle();
 
     if (walletError || !wallet) {
@@ -412,10 +455,12 @@ Deno.serve(async (req: Request) => {
       .from('tbl_withdrawal_requests')
       .select('twr_amount')
       .eq('twr_user_id', userId)
+      .eq('twr_wallet_type', walletType)
       .in('twr_status', ['pending', 'processing', 'approved']);
 
     const pendingTotal = (pendingRows || []).reduce((sum: number, row: any) => sum + Number(row.twr_amount || 0), 0);
-    const availableBalance = Number(wallet.tw_balance || 0) - pendingTotal;
+    const reservedBalance = walletType === 'working' ? Number((wallet as any).tw_reserved_balance || 0) : 0;
+    const availableBalance = Number(wallet.tw_balance || 0) - reservedBalance - pendingTotal;
 
     if (withdrawalAmount > availableBalance) {
       return new Response(JSON.stringify({ success: false, error: 'Insufficient wallet balance' }), {
@@ -438,7 +483,8 @@ Deno.serve(async (req: Request) => {
         twr_commission_amount: commissionAmount,
         twr_net_amount: netAmount,
         twr_status: autoTransfer ? 'processing' : 'pending',
-        twr_auto_transfer: autoTransfer
+        twr_auto_transfer: autoTransfer,
+        twr_wallet_type: walletType
       })
       .select()
       .single();
@@ -488,6 +534,7 @@ Deno.serve(async (req: Request) => {
       amount: withdrawalAmount,
       netAmount,
       destinationAddress: defaultWallet.tuwc_wallet_address,
+      walletType,
       adminPaymentWallet,
       usdtAddress,
       paymentMode
@@ -529,6 +576,19 @@ Deno.serve(async (req: Request) => {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     } catch (error: any) {
+      if (error?.status === 'submitted_pending_confirmation' && error?.txHash) {
+        return new Response(JSON.stringify({
+          success: false,
+          request_id: requestRow.twr_id,
+          status: 'processing',
+          txHash: error.txHash,
+          error: error.message || 'Withdrawal transfer submitted but confirmation is pending',
+        }), {
+          status: 202,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+
       const failureReason = formatWithdrawalFailureReason(error);
       const adminDebug = formatWithdrawalAdminDebug(error);
 

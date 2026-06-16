@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
 import { useMLM } from '../../contexts/MLMContext';
+import { useAdmin } from '../../contexts/AdminContext';
 import { supabase } from '../../lib/supabase';
 import ReferralLinkGenerator from '../../components/mlm/ReferralLinkGenerator';
 import TransactionsDashboard from '../../components/customer/TransactionsDashboard';
@@ -75,6 +77,8 @@ const CustomerDashboard: React.FC = () => {
   const { user } = useAuth();
   const notification = useNotification();
   const { treeData, getTreeStats, loadTreeData } = useMLM();
+  const { settings } = useAdmin();
+  const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState('overview');
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [dashboardStats, setDashboardStats] = useState<DashboardStats>({
@@ -300,7 +304,12 @@ const CustomerDashboard: React.FC = () => {
   };
 
   const handleUpgradePlan = () => {
-    notification.showInfo('Upcoming Feature', 'Upgrade Plan is coming soon.');
+    if ((settings?.launchPhase || 'prelaunch') !== 'launched') {
+      notification.showInfo('Not Available Yet', 'Upgrade plans will be available after launch.');
+      return;
+    }
+    setIsSidebarOpen(false);
+    navigate('/subscription-plans');
   };
 
   const formatTimeAgo = (timestamp: string) => {
@@ -491,6 +500,36 @@ const CustomerDashboard: React.FC = () => {
               <div className="p-6">
                 {activeTab === 'overview' && (
                     <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                      {/* Quick Actions */}
+                      <div>
+                        <h3 className="text-lg font-semibold text-gray-900 mb-4">Quick Actions</h3>
+                        <div className="space-y-3">
+                          <button
+                              onClick={handleInviteMembers}
+                              className="w-full bg-indigo-600 text-white py-3 px-4 rounded-lg font-medium hover:bg-indigo-700 transition-colors flex items-center justify-center space-x-2"
+                          >
+                            <Send className="h-4 w-4" />
+                            <span>Invite New Members</span>
+                          </button>
+                          <button
+                              onClick={handleViewEarningsReport}
+                              className="w-full bg-green-600 text-white py-3 px-4 rounded-lg font-medium hover:bg-green-700 transition-colors flex items-center justify-center space-x-2"
+                          >
+                            <Download className="h-4 w-4" />
+                            <span>View Earnings Report</span>
+                          </button>
+	                          {(settings?.launchPhase || 'prelaunch') === 'launched' && (
+	                            <button
+	                              onClick={handleUpgradePlan}
+	                              className="w-full bg-purple-600 text-white py-3 px-4 rounded-lg font-medium hover:bg-purple-700 transition-colors flex items-center justify-center space-x-2"
+	                            >
+	                              <ExternalLink className="h-4 w-4" />
+	                              <span>Upgrade Plan</span>
+	                            </button>
+	                          )}
+                        </div>
+                      </div>
+
                       {/* Recent Activities */}
                       <div>
                         <h3 className="text-lg font-semibold text-gray-900 mb-4">Recent Activities</h3>
@@ -516,34 +555,6 @@ const CustomerDashboard: React.FC = () => {
                           ) : (
                               <p className="text-gray-500 text-center py-4">No recent activities</p>
                           )}
-                        </div>
-                      </div>
-
-                      {/* Quick Actions */}
-                      <div>
-                        <h3 className="text-lg font-semibold text-gray-900 mb-4">Quick Actions</h3>
-                        <div className="space-y-3">
-                          <button
-                              onClick={handleInviteMembers}
-                              className="w-full bg-indigo-600 text-white py-3 px-4 rounded-lg font-medium hover:bg-indigo-700 transition-colors flex items-center justify-center space-x-2"
-                          >
-                            <Send className="h-4 w-4" />
-                            <span>Invite New Members</span>
-                          </button>
-                          <button
-                              onClick={handleViewEarningsReport}
-                              className="w-full bg-green-600 text-white py-3 px-4 rounded-lg font-medium hover:bg-green-700 transition-colors flex items-center justify-center space-x-2"
-                          >
-                            <Download className="h-4 w-4" />
-                            <span>View Earnings Report</span>
-                          </button>
-                          <button
-                              onClick={handleUpgradePlan}
-                              className="w-full bg-purple-600 text-white py-3 px-4 rounded-lg font-medium hover:bg-purple-700 transition-colors flex items-center justify-center space-x-2"
-                          >
-                            <ExternalLink className="h-4 w-4" />
-                            <span>Upgrade Plan</span>
-                          </button>
                         </div>
                       </div>
                     </div>

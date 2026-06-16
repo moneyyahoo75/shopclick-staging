@@ -64,7 +64,7 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const { paymentId } = await req.json();
+    const { paymentId, manualVerified = false } = await req.json();
 
     if (!paymentId) {
       return new Response(
@@ -109,7 +109,30 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    if (payment.subscription?.plan?.tsp_type !== 'registration') {
+    let registrationPlan = payment.subscription?.plan ?? null;
+
+    if (!registrationPlan || registrationPlan.tsp_type !== 'registration') {
+      const { data: activeRegistrationPlan, error: planError } = await supabase
+        .from('tbl_subscription_plans')
+        .select('tsp_id, tsp_price, tsp_type, tsp_parent_income, tsp_duration_days')
+        .eq('tsp_type', 'registration')
+        .eq('tsp_is_active', true)
+        .maybeSingle();
+
+      if (planError || !activeRegistrationPlan) {
+        return new Response(
+          JSON.stringify({ success: false, error: 'Only registration payments can process referral earnings' }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          }
+        );
+      }
+
+      registrationPlan = activeRegistrationPlan;
+    }
+
+    if (registrationPlan.tsp_type !== 'registration') {
       return new Response(
         JSON.stringify({ success: false, error: 'Only registration payments can process referral earnings' }),
         {
@@ -119,8 +142,46 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const paymentAmount = Number(payment.tp_amount ?? payment.subscription?.plan?.tsp_price ?? 0);
-    const parentIncomeSetting = Number(payment.subscription?.plan?.tsp_parent_income ?? 0);
+    const paymentAmount = Number(payment.tp_amount ?? registrationPlan.tsp_price ?? 0);
+    const txHash = String(payment.tp_transaction_id || '').trim();
+
+    if (txHash) {
+      const { data: duplicatePayment, error: duplicateError } = await supabase
+        .from('tbl_payments')
+        .select('tp_id, tp_user_id, tp_payment_status')
+        .eq('tp_transaction_id', txHash)
+        .neq('tp_id', paymentId)
+        .maybeSingle();
+
+      if (duplicateError) {
+        throw duplicateError;
+      }
+
+      if (duplicatePayment?.tp_id) {
+        return new Response(
+          JSON.stringify({ success: false, error: 'Transaction hash is already linked to another payment' }),
+          {
+            status: 409,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          }
+        );
+      }
+
+      const amountReceived = Number(payment.tp_amount_received ?? 0);
+      const hasSystemVerification = Boolean(payment.tp_block_number) && amountReceived >= paymentAmount;
+
+      if (!hasSystemVerification && manualVerified !== true) {
+        return new Response(
+          JSON.stringify({ success: false, error: 'Please verify this blockchain transaction before approving it' }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          }
+        );
+      }
+    }
+
+    const parentIncomeSetting = Number(registrationPlan.tsp_parent_income ?? 0);
     const normalizedParentIncome = Number.isFinite(parentIncomeSetting) && parentIncomeSetting > 0
       ? parentIncomeSetting
       : 0;
@@ -149,6 +210,9 @@ Deno.serve(async (req: Request) => {
       childSponsorshipNumber ||
       'unknown account'
     );
+    const childCommissionLabel = childSponsorshipNumber
+      ? `Sponsorship ${childSponsorshipNumber}`
+      : childDisplayName;
 
     if (parentAccount) {
       const { data: sponsorProfile } = await supabase
@@ -164,13 +228,13 @@ Deno.serve(async (req: Request) => {
 
         const { data: sponsorUser } = await supabase
           .from('tbl_users')
-          .select('tu_is_active, tu_registration_paid')
+          .select('tu_is_active, tu_registration_paid, tu_mobile_verified')
           .eq('tu_id', sponsorUserId)
           .maybeSingle();
 
-        if (!sponsorUser?.tu_is_active || !sponsorUser?.tu_registration_paid) {
+        if (!sponsorUser?.tu_is_active || !sponsorUser?.tu_registration_paid || !sponsorUser?.tu_mobile_verified) {
           return new Response(
-            JSON.stringify({ success: false, error: 'Parent A/C is not active or registration-paid' }),
+            JSON.stringify({ success: false, error: 'Parent A/C is not active/verified or registration-paid' }),
             {
               status: 400,
               headers: { ...corsHeaders, 'Content-Type': 'application/json' },
@@ -181,13 +245,71 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    const { error: updateSubscriptionError } = await supabase
-      .from('tbl_user_subscriptions')
-      .update({ tus_status: 'active' })
-      .eq('tus_id', payment.tp_subscription_id);
+    let subscriptionId = payment.tp_subscription_id || null;
 
-    if (updateSubscriptionError) {
-      throw updateSubscriptionError;
+    if (subscriptionId) {
+      const { error: updateSubscriptionError } = await supabase
+        .from('tbl_user_subscriptions')
+        .update({ tus_status: 'active' })
+        .eq('tus_id', subscriptionId);
+
+      if (updateSubscriptionError) {
+        throw updateSubscriptionError;
+      }
+    } else {
+      const rawDurationDays = Number(registrationPlan.tsp_duration_days);
+      const startDate = new Date();
+      const endDate =
+        Number.isFinite(rawDurationDays) && rawDurationDays > 0
+          ? new Date(startDate.getTime() + rawDurationDays * 24 * 60 * 60 * 1000)
+          : new Date('9999-12-31T23:59:59.999Z');
+
+      const { data: existingSubscription, error: existingSubscriptionError } = await supabase
+        .from('tbl_user_subscriptions')
+        .select('tus_id')
+        .eq('tus_user_id', payment.tp_user_id)
+        .eq('tus_plan_id', registrationPlan.tsp_id)
+        .maybeSingle();
+
+      if (existingSubscriptionError) {
+        throw existingSubscriptionError;
+      }
+
+      if (existingSubscription?.tus_id) {
+        subscriptionId = existingSubscription.tus_id;
+        const { error: updateExistingSubscriptionError } = await supabase
+          .from('tbl_user_subscriptions')
+          .update({
+            tus_status: 'active',
+            tus_start_date: startDate.toISOString(),
+            tus_end_date: endDate.toISOString(),
+            tus_payment_amount: paymentAmount
+          })
+          .eq('tus_id', subscriptionId);
+
+        if (updateExistingSubscriptionError) {
+          throw updateExistingSubscriptionError;
+        }
+      } else {
+        const { data: createdSubscription, error: createSubscriptionError } = await supabase
+          .from('tbl_user_subscriptions')
+          .insert({
+            tus_user_id: payment.tp_user_id,
+            tus_plan_id: registrationPlan.tsp_id,
+            tus_status: 'active',
+            tus_start_date: startDate.toISOString(),
+            tus_end_date: endDate.toISOString(),
+            tus_payment_amount: paymentAmount
+          })
+          .select('tus_id')
+          .single();
+
+        if (createSubscriptionError) {
+          throw createSubscriptionError;
+        }
+
+        subscriptionId = createdSubscription?.tus_id || null;
+      }
     }
 
     if (sponsorUserId && normalizedParentIncome > 0 && !isDefaultParent) {
@@ -198,6 +320,7 @@ Deno.serve(async (req: Request) => {
     const { error: updatePaymentError } = await supabase
       .from('tbl_payments')
       .update({
+        tp_subscription_id: subscriptionId,
         tp_payment_status: 'completed',
         tp_verified_at: new Date().toISOString(),
         tp_processed_by_admin_id: adminUser.tau_id,
@@ -213,7 +336,9 @@ Deno.serve(async (req: Request) => {
           direct_account_number: null,
           is_default_parent: isDefaultParent,
           parent_account: parentAccount || null,
-          parent_user_id: sponsorUserId || null
+          parent_user_id: sponsorUserId || null,
+          manual_admin_verified: txHash ? manualVerified === true : false,
+          manual_admin_verified_at: txHash && manualVerified === true ? new Date().toISOString() : null
         }
       })
       .eq('tp_id', paymentId);
@@ -231,7 +356,33 @@ Deno.serve(async (req: Request) => {
       .eq('tu_id', payment.tp_user_id);
 
     if (sponsorUserId) {
-        const walletCache = new Map<string, { walletId: string; baseBalance: number; totalInserted: number }>();
+        const walletCache = new Map<
+          string,
+          { walletId: string; baseBalance: number; baseReservedBalance: number; totalBalanceInserted: number; totalReservedInserted: number }
+        >();
+
+        const hasActiveUpgrade = async (userId: string) => {
+          const now = new Date();
+          const { data: subs, error: subsError } = await supabase
+            .from('tbl_user_subscriptions')
+            .select('tus_end_date, tus_status, plan:tus_plan_id(tsp_type)')
+            .eq('tus_user_id', userId)
+            .eq('tus_status', 'active')
+            .limit(50);
+
+          if (subsError) {
+            console.error('Failed to load user subscriptions:', subsError);
+            return false;
+          }
+
+          return (subs || []).some((row: any) => {
+            const planType = String(row?.plan?.tsp_type || '').toLowerCase();
+            if (planType !== 'upgrade') return false;
+            const endDateRaw = row?.tus_end_date ? new Date(String(row.tus_end_date)) : null;
+            if (!endDateRaw) return true;
+            return endDateRaw.getTime() > now.getTime();
+          });
+        };
 
         const ensureWalletForUser = async (userId: string) => {
           const cached = walletCache.get(userId);
@@ -239,8 +390,9 @@ Deno.serve(async (req: Request) => {
 
           const { data: existingWallet, error: existingError } = await supabase
             .from('tbl_wallets')
-            .select('tw_id, tw_balance')
+            .select('tw_id, tw_balance, tw_reserved_balance')
             .eq('tw_user_id', userId)
+            .eq('tw_wallet_type', 'working')
             .maybeSingle();
 
           if (existingError) {
@@ -250,6 +402,7 @@ Deno.serve(async (req: Request) => {
 
           let resolvedWalletId = existingWallet?.tw_id || null;
           let resolvedBalance = parseFloat(String(existingWallet?.tw_balance || 0));
+          let resolvedReservedBalance = parseFloat(String((existingWallet as any)?.tw_reserved_balance || 0));
 
           if (!resolvedWalletId) {
             const { data: createdWallet, error: createError } = await supabase
@@ -257,7 +410,9 @@ Deno.serve(async (req: Request) => {
               .insert({
                 tw_user_id: userId,
                 tw_balance: 0,
-                tw_currency: 'USDT'
+                tw_reserved_balance: 0,
+                tw_currency: 'USDT',
+                tw_wallet_type: 'working'
               })
               .select()
               .single();
@@ -269,21 +424,33 @@ Deno.serve(async (req: Request) => {
 
             resolvedWalletId = createdWallet?.tw_id || null;
             resolvedBalance = 0;
+            resolvedReservedBalance = 0;
           }
 
           if (!resolvedWalletId) return null;
 
-          const entry = { walletId: resolvedWalletId, baseBalance: resolvedBalance, totalInserted: 0 };
+          const entry = {
+            walletId: resolvedWalletId,
+            baseBalance: resolvedBalance,
+            baseReservedBalance: resolvedReservedBalance,
+            totalBalanceInserted: 0,
+            totalReservedInserted: 0
+          };
           walletCache.set(userId, entry);
           return entry;
         };
 
         const insertWalletTxIfMissing = async (
           userId: string,
-          referenceType: 'registration_parent_income' | 'mlm_level_reward',
+          referenceType:
+            | 'registration_parent_income'
+            | 'registration_parent_income_reserved'
+            | 'mlm_level_reward'
+            | 'mlm_level_reward_reserved',
           amount: number,
           description: string,
-          referenceId: string
+          referenceId: string,
+          bucket: 'available' | 'reserved' = 'available'
         ) => {
           if (amount <= 0) return 0;
 
@@ -323,18 +490,47 @@ Deno.serve(async (req: Request) => {
             return 0;
           }
 
-          walletInfo.totalInserted += amount;
+          if (bucket === 'reserved') {
+            walletInfo.totalReservedInserted += amount;
+          } else {
+            walletInfo.totalBalanceInserted += amount;
+          }
           return amount;
         };
 
         if (parentIncomeApplied > 0 && sponsorUserId && !isDefaultParent) {
-          await insertWalletTxIfMissing(
-            sponsorUserId,
-            'registration_parent_income',
-            parentIncomeApplied,
-            `Registration commission from ${childDisplayName}`,
-            paymentId
-          );
+          const sponsorUpgraded = await hasActiveUpgrade(sponsorUserId);
+          if (sponsorUpgraded) {
+            await insertWalletTxIfMissing(
+              sponsorUserId,
+              'registration_parent_income',
+              parentIncomeApplied,
+              `Registration commission from ${childCommissionLabel}`,
+              paymentId,
+              'available'
+            );
+          } else {
+            const availablePortion = Number((parentIncomeApplied * 0.5).toFixed(6));
+            const reservedPortion = Number((parentIncomeApplied - availablePortion).toFixed(6));
+
+            await insertWalletTxIfMissing(
+              sponsorUserId,
+              'registration_parent_income',
+              availablePortion,
+              `Registration commission from ${childCommissionLabel}`,
+              paymentId,
+              'available'
+            );
+
+            await insertWalletTxIfMissing(
+              sponsorUserId,
+              'registration_parent_income_reserved',
+              reservedPortion,
+              `Reserved from registration commission (for future upgrade) from ${childCommissionLabel}`,
+              paymentId,
+              'reserved'
+            );
+          }
         }
 
         if (childSponsorshipNumber) {
@@ -396,13 +592,31 @@ Deno.serve(async (req: Request) => {
                   level2Count >= milestone.level2 &&
                   level3Count >= milestone.level3
                 ) {
+                  const uplineUpgraded = await hasActiveUpgrade(uplineUserId);
+                  const availableReward = uplineUpgraded
+                    ? milestone.amount
+                    : Number((milestone.amount * 0.5).toFixed(6));
+                  const reservedReward = Number((milestone.amount - availableReward).toFixed(6));
+
                   await insertWalletTxIfMissing(
                     uplineUserId,
                     'mlm_level_reward',
-                    milestone.amount,
+                    availableReward,
                     milestone.title,
-                    milestone.id
+                    milestone.id,
+                    'available'
                   );
+
+                  if (reservedReward > 0) {
+                    await insertWalletTxIfMissing(
+                      uplineUserId,
+                      'mlm_level_reward_reserved',
+                      reservedReward,
+                      `Reserved from ${milestone.title} (for future upgrade)`,
+                      milestone.id,
+                      'reserved'
+                    );
+                  }
                 }
               }
             }
@@ -410,11 +624,13 @@ Deno.serve(async (req: Request) => {
         }
 
         for (const [userId, walletInfo] of walletCache.entries()) {
-          if (walletInfo.totalInserted <= 0) continue;
-          const newBalance = walletInfo.baseBalance + walletInfo.totalInserted;
+          const totalInserted = walletInfo.totalBalanceInserted + walletInfo.totalReservedInserted;
+          if (totalInserted <= 0) continue;
+          const newBalance = walletInfo.baseBalance + totalInserted;
+          const newReservedBalance = walletInfo.baseReservedBalance + walletInfo.totalReservedInserted;
           const { error: updateWalletError } = await supabase
             .from('tbl_wallets')
-            .update({ tw_balance: newBalance })
+            .update({ tw_balance: newBalance, tw_reserved_balance: newReservedBalance })
             .eq('tw_id', walletInfo.walletId);
 
           if (updateWalletError) {

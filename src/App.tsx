@@ -1,6 +1,5 @@
-import React from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate, useLocation } from 'react-router-dom';
-import { useEffect } from 'react';
 import { AuthProvider } from './contexts/AuthContext';
 import { NotificationProvider } from './components/ui/NotificationProvider';
 import SessionWarning from './components/ui/SessionWarning';
@@ -38,6 +37,23 @@ import Maintenance from './pages/Maintenance';
 import ProtectedRoute from './components/auth/ProtectedRoute';
 import AdminProtectedRoute from './components/auth/AdminProtectedRoute';
 import GuestRoute from './components/auth/GuestRoute';
+import { getMaintenanceNoticeState, isMaintenanceActiveNow } from './utils/maintenanceWindow';
+
+// Persists the current route so MetaMask DApp browser can restore it after reload
+const SESSION_ROUTE_KEY = 'app_last_route';
+
+function RouteTracker() {
+  const { pathname, search } = useLocation();
+
+  useEffect(() => {
+    // Don't persist auth callback or reset-password paths to avoid redirect loops
+    if (pathname !== '/' && !pathname.startsWith('/auth/')) {
+      sessionStorage.setItem(SESSION_ROUTE_KEY, pathname + search);
+    }
+  }, [pathname, search]);
+
+  return null;
+}
 
 // Scroll to top component
 function ScrollToTop() {
@@ -66,6 +82,7 @@ function App() {
               <Router>
                 <div className="min-h-screen bg-gray-50">
                   <ScrollToTop />
+                  <RouteTracker />
                   <Routes>
                     {/* Backpanel Routes (No Navbar/Footer) */}
                     <Route path="/backpanel/login" element={
@@ -94,16 +111,64 @@ function App() {
 
 const MainSite: React.FC = () => {
   const { settings } = useAdmin();
-  const maintenanceEnabled = Boolean(settings?.maintenanceMode);
+  const maintenanceActive = isMaintenanceActiveNow(settings as any);
+  const allowedIps = Array.isArray((settings as any)?.maintenanceAllowedIps) ? ((settings as any).maintenanceAllowedIps as string[]) : [];
+  const notice = useMemo(() => getMaintenanceNoticeState(settings as any), [settings]);
+  const [clientIp, setClientIp] = useState<string | null>(null);
+  const [ipChecked, setIpChecked] = useState(false);
 
-  if (maintenanceEnabled) {
-    return <Maintenance />;
+  useEffect(() => {
+    let mounted = true;
+    const loadIp = async () => {
+      if (!maintenanceActive || allowedIps.length === 0) {
+        if (mounted) setIpChecked(true);
+        return;
+      }
+
+      try {
+        const baseUrl = import.meta.env.VITE_SUPABASE_URL;
+        const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+        const res = await fetch(`${baseUrl}/functions/v1/get-client-ip`, {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${anonKey}`,
+            apikey: anonKey,
+          },
+        });
+        const json = await res.json();
+        const ip = String(json?.ip || '').trim();
+        if (mounted) setClientIp(ip || null);
+      } catch {
+        if (mounted) setClientIp(null);
+      } finally {
+        if (mounted) setIpChecked(true);
+      }
+    };
+
+    setIpChecked(false);
+    loadIp();
+    return () => {
+      mounted = false;
+    };
+  }, [maintenanceActive, allowedIps.length]);
+
+  const isAllowedByIp = useMemo(() => {
+    if (!maintenanceActive) return true;
+    if (allowedIps.length === 0) return false;
+    if (!clientIp) return false;
+    return allowedIps.includes(clientIp);
+  }, [maintenanceActive, allowedIps, clientIp]);
+
+  if (maintenanceActive) {
+    if (allowedIps.length === 0) return <Maintenance />;
+    if (!ipChecked) return <Maintenance />;
+    if (!isAllowedByIp) return <Maintenance />;
   }
 
   return (
     <>
       <Navbar />
-      <main className="pt-16">
+      <main className={notice.showBanner ? 'pt-24' : 'pt-16'}>
         <Routes>
           <Route path="/" element={<Home />} />
 

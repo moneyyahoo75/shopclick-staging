@@ -20,6 +20,7 @@ const EarningsDashboard: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [walletBalance, setWalletBalance] = useState(0);
+  const [walletReservedBalance, setWalletReservedBalance] = useState(0);
   const [reservedWithdrawals, setReservedWithdrawals] = useState(0);
   const [dateFrom, setDateFrom] = useState(() => {
     const d = new Date();
@@ -74,13 +75,15 @@ const EarningsDashboard: React.FC = () => {
     try {
       const { data, error } = await supabase
         .from('tbl_wallets')
-        .select('tw_balance')
+        .select('tw_balance, tw_reserved_balance')
         .eq('tw_user_id', user.id)
         .eq('tw_currency', 'USDT')
+        .eq('tw_wallet_type', 'working')
         .maybeSingle();
 
       if (error) throw error;
       setWalletBalance(toAmount((data as any)?.tw_balance));
+      setWalletReservedBalance(toAmount((data as any)?.tw_reserved_balance));
     } catch (error) {
       console.error('Failed to load wallet balance:', error);
     }
@@ -93,6 +96,7 @@ const EarningsDashboard: React.FC = () => {
         .from('tbl_withdrawal_requests')
         .select('twr_amount, twr_status')
         .eq('twr_user_id', user.id)
+        .eq('twr_wallet_type', 'working')
         .in('twr_status', ['pending', 'processing', 'approved']);
 
       if (error) throw error;
@@ -104,8 +108,8 @@ const EarningsDashboard: React.FC = () => {
   };
 
   const withdrawableBalance = useMemo(() => {
-    return Math.max(0, walletBalance - reservedWithdrawals);
-  }, [walletBalance, reservedWithdrawals]);
+    return Math.max(0, walletBalance - walletReservedBalance - reservedWithdrawals);
+  }, [walletBalance, walletReservedBalance, reservedWithdrawals]);
 
   const handleRefresh = async () => {
     setRefreshing(true);
@@ -197,13 +201,6 @@ const EarningsDashboard: React.FC = () => {
           </div>
           <p className="text-2xl font-bold text-green-600 mt-2">{allTimeCredits.toFixed(2)} USDT</p>
         </div>
-        <div className="bg-blue-50 p-4 rounded-lg">
-          <div className="flex items-center space-x-2">
-            <Clock className="h-5 w-5 text-blue-600" />
-            <span className="text-sm font-medium text-blue-800">This Month Earnings</span>
-          </div>
-          <p className="text-2xl font-bold text-blue-600 mt-2">{monthCredits.toFixed(2)} USDT</p>
-        </div>
         <div className="bg-indigo-50 p-4 rounded-lg">
           <div className="flex items-center space-x-2">
             <Clock className="h-5 w-5 text-indigo-600" />
@@ -218,10 +215,17 @@ const EarningsDashboard: React.FC = () => {
           </div>
           <p className="text-2xl font-bold text-red-600 mt-2">{allTimeDebits.toFixed(2)} USDT</p>
         </div>
+        <div className="bg-yellow-50 p-4 rounded-lg">
+          <div className="flex items-center space-x-2">
+            <Clock className="h-5 w-5 text-yellow-600" />
+            <span className="text-sm font-medium text-yellow-800">Reserved (For Upgrade)</span>
+          </div>
+          <p className="text-2xl font-bold text-yellow-700 mt-2">{walletReservedBalance.toFixed(2)} USDT</p>
+        </div>
         <div className="bg-blue-50 p-4 rounded-lg">
           <div className="flex items-center space-x-2">
             <Clock className="h-5 w-5 text-blue-600" />
-            <span className="text-sm font-medium text-blue-800">Reserved Withdrawals</span>
+            <span className="text-sm font-medium text-blue-800">Pending Withdrawals</span>
           </div>
           <p className="text-2xl font-bold text-blue-600 mt-2">{reservedWithdrawals.toFixed(2)} USDT</p>
         </div>
@@ -231,7 +235,6 @@ const EarningsDashboard: React.FC = () => {
             <span className="text-sm font-medium text-indigo-800">Withdrawable</span>
           </div>
           <p className="text-2xl font-bold text-indigo-600 mt-2">{withdrawableBalance.toFixed(2)} USDT</p>
-          <p className="text-xs text-indigo-700 mt-1">Total: {walletBalance.toFixed(2)} USDT</p>
         </div>
       </div>
 

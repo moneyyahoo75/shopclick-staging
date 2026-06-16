@@ -16,9 +16,10 @@ interface PaymentDetails {
 const RegistrationPaymentSuccess: React.FC = () => {
   const location = useLocation();
   const navigate = useNavigate();
-  const { user } = useAuth();
+  const { user, fetchUserData } = useAuth();
   const [payment, setPayment] = useState<PaymentDetails | null>(null);
   const [loading, setLoading] = useState(true);
+  const [openingDashboard, setOpeningDashboard] = useState(false);
 
   const state = location.state as { txHash?: string; amount?: number; network?: string } | null;
   const txHash = state?.txHash || new URLSearchParams(location.search).get('tx');
@@ -60,6 +61,18 @@ const RegistrationPaymentSuccess: React.FC = () => {
     window.open(explorerUrl, '_blank', 'noopener,noreferrer');
   };
 
+  const goToDashboard = async () => {
+    setOpeningDashboard(true);
+    try {
+      if (user?.id) {
+        await fetchUserData(user.id);
+      }
+    } finally {
+      navigate('/customer/dashboard', { replace: true });
+      setOpeningDashboard(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="min-h-screen bg-gray-50 flex items-center justify-center">
@@ -97,13 +110,13 @@ const RegistrationPaymentSuccess: React.FC = () => {
           {txHash && (
             <div>
               <p className="text-sm text-gray-500 mb-2">Transaction Hash</p>
-              <div className="flex items-center space-x-2">
-                <code className="flex-1 px-3 py-2 bg-gray-50 text-gray-900 rounded border border-gray-200 font-mono text-sm">
+              <div className="transaction-hash-container flex items-center gap-2">
+                <code className="transaction-hash-code min-w-0 flex-1 overflow-x-auto scrollbar-hide whitespace-nowrap px-3 py-2 bg-gray-50 text-gray-900 rounded border border-gray-200 font-mono text-sm">
                   {txHash}
                 </code>
                 <button
                   onClick={openExplorer}
-                  className="p-2 bg-blue-100 hover:bg-blue-200 text-blue-700 rounded transition-colors border border-blue-200"
+                  className="transaction-hash-button flex-shrink-0 p-2 bg-blue-100 hover:bg-blue-200 text-blue-700 rounded transition-colors border border-blue-200"
                   title="View on explorer"
                 >
                   <ExternalLink className="w-4 h-4" />
@@ -114,11 +127,12 @@ const RegistrationPaymentSuccess: React.FC = () => {
         </div>
 
         <button
-          onClick={() => navigate('/customer/dashboard')}
-          className="mt-8 w-full flex items-center justify-center space-x-2 px-6 py-3 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium"
+          onClick={goToDashboard}
+          disabled={openingDashboard}
+          className="mt-8 w-full flex items-center justify-center space-x-2 px-6 py-3 bg-green-600 hover:bg-green-700 disabled:opacity-60 text-white rounded-lg font-medium"
         >
           <Home className="w-5 h-5" />
-          <span>Go to Dashboard</span>
+          <span>{openingDashboard ? 'Opening Dashboard...' : 'Go to Dashboard'}</span>
         </button>
       </div>
     </div>

@@ -50,8 +50,11 @@ export interface WalletTransaction {
       | 'deposit'
       | 'transfer'
       | 'registration_parent_income'
+      | 'registration_parent_income_reserved'
       | 'registration_payment'
-      | 'mlm_level_reward';
+      | 'upgrade_from_reserved'
+      | 'mlm_level_reward'
+      | 'mlm_level_reward_reserved';
     referenceId?: string;
     blockchainHash?: string;
     status: 'pending' | 'completed' | 'failed' | 'cancelled';

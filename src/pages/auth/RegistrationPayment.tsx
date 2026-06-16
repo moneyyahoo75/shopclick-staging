@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState, useCallback } from 'react';
+import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { supabase } from '../../lib/supabase';
 import { useAuth } from '../../contexts/AuthContext';
@@ -22,7 +22,48 @@ interface RegistrationPlan {
 }
 
 const PAYMENT_POLL_INTERVAL = 5000;
-const PAYMENT_POLL_ATTEMPTS = 12;
+// 24 attempts × 5s = 120s total — gives more time on slow Android networks
+const PAYMENT_POLL_ATTEMPTS = 24;
+// Android MetaMask can take much longer to return from the wallet app; use 90s
+const PAYMENT_REQUEST_TIMEOUT_MS = 90000;
+const PAYMENT_RECOVERY_STORAGE_KEY = 'registration_payment_recovery_attempt';
+const LAST_CUSTOMER_ROUTE_STORAGE_KEY = 'last_customer_route';
+// Persists the tx hash the instant the wallet confirms it, so we can resume verification
+// if Android MetaMask causes a page reload before verification completes.
+const PENDING_TX_HASH_KEY = 'registration_payment_pending_tx';
+
+const savePendingTxHash = (txHash: string) => {
+  try {
+    sessionStorage.setItem(PENDING_TX_HASH_KEY, txHash);
+    localStorage.setItem(PENDING_TX_HASH_KEY, txHash);
+  } catch { /* storage may be unavailable */ }
+};
+
+const loadPendingTxHash = (): string | null => {
+  try {
+    return sessionStorage.getItem(PENDING_TX_HASH_KEY) || localStorage.getItem(PENDING_TX_HASH_KEY) || null;
+  } catch {
+    return null;
+  }
+};
+
+const clearPendingTxHash = () => {
+  try {
+    sessionStorage.removeItem(PENDING_TX_HASH_KEY);
+    localStorage.removeItem(PENDING_TX_HASH_KEY);
+  } catch { /* ignore */ }
+};
+
+interface PaymentRecoveryAttempt {
+  userId: string;
+  walletAddress: string;
+  toAddress: string;
+  amount: number;
+  chainId: number | null;
+  usdtAddress: string | null;
+  startedAt: string;
+  startBlock: number | null;
+}
 
 let cachedRegistrationPlan: RegistrationPlan | null = null;
 let inFlightRegistrationPlanRequest: Promise<RegistrationPlan | null> | null = null;
@@ -56,15 +97,35 @@ const RegistrationPayment: React.FC = () => {
   const [parentAccountError, setParentAccountError] = useState<string | null>(null);
   const [reverifyHash, setReverifyHash] = useState('');
   const [reverifyProcessing, setReverifyProcessing] = useState(false);
+  const recoveryCheckInFlightRef = useRef(false);
+  // Captures the tx hash from transferPromise even if it resolves after the timeout race
+  const lateHashRef = useRef<string | null>(null);
+  // Prevents the page-reload auto-resume from firing more than once per mount
+  const autoResumeAttemptedRef = useRef(false);
 
   useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const routeState = JSON.stringify({ path: '/registration-payment', savedAt: Date.now() });
+      sessionStorage.setItem(LAST_CUSTOMER_ROUTE_STORAGE_KEY, routeState);
+      localStorage.setItem(LAST_CUSTOMER_ROUTE_STORAGE_KEY, routeState);
+    }
+
     if (!user) {
       navigate('/customer/login');
       return;
     }
 
-    if (user.hasActiveSubscription) {
-      navigate('/customer/dashboard', { replace: true });
+    if (!settingsLoading && (settings.launchPhase || 'prelaunch') === 'launched') {
+      navigate('/subscription-plans', { replace: true });
+      return;
+    }
+
+    if (user.hasActiveSubscription || user.registrationPaid) {
+      // If there's a pending tx hash in storage, the auto-resume effect will navigate to the
+      // success page — don't override it with the dashboard redirect.
+      if (!loadPendingTxHash()) {
+        navigate('/customer/dashboard', { replace: true });
+      }
       return;
     }
 
@@ -109,7 +170,7 @@ const RegistrationPayment: React.FC = () => {
     }
 
     loadRegistrationData();
-  }, [user, navigate, notification]);
+  }, [user, settings.launchPhase, settingsLoading, navigate, notification]);
 
   useEffect(() => {
     const validateParentAccount = async () => {
@@ -157,6 +218,142 @@ const RegistrationPayment: React.FC = () => {
 
     validateParentAccount();
   }, [user?.id]);
+
+  // On Android MetaMask the DApp browser may fully reload the page when switching back from
+  // the wallet app. If that happens, the tx hash that sendUSDTTransfer returned is gone from
+  // memory. We persist it to sessionStorage/localStorage the instant we receive it, and here
+  // we pick it back up and resume verification automatically so the payment completes.
+  useEffect(() => {
+    if (!user || !plan || loading || settingsLoading) return;
+    if (user.hasActiveSubscription || user.registrationPaid) return;
+    if (autoResumeAttemptedRef.current) return;
+    autoResumeAttemptedRef.current = true;
+
+    const pendingHash = loadPendingTxHash();
+    if (!pendingHash || !/^0x[a-fA-F0-9]{64}$/.test(pendingHash)) return;
+
+    const resume = async () => {
+      setTransaction({
+        isProcessing: true,
+        hash: pendingHash,
+        status: 'pending',
+        error: null,
+        distributionSteps: ['Resumed verification after page reload (Android MetaMask)'],
+      });
+      setStatusMessage('Resuming payment verification...');
+      scrollToPaymentStatus();
+
+      try {
+        const result = await pollVerification(pendingHash);
+        clearPendingTxHash();
+        clearRecoveryAttempt();
+        setTransaction({
+          isProcessing: false,
+          hash: pendingHash,
+          status: 'success',
+          error: null,
+          distributionSteps: ['Payment verified after page reload (Android MetaMask)'],
+        });
+        setStatusMessage('Payment confirmed!');
+        notification.showSuccess('Payment Successful', 'Your registration payment was confirmed.');
+        navigate('/registration-payment-success', {
+          state: {
+            txHash: pendingHash,
+            amount: result.amount || plan.tsp_price,
+            network: result.network
+          }
+        });
+        void fetchUserData(user!.id);
+      } catch (verifyError: any) {
+        clearPendingTxHash();
+        await saveRegistrationPaymentIssue(pendingHash, verifyError, ['Resumed after page reload']);
+        const userMessage = getStuckPaymentMessage(verifyError, pendingHash);
+        setTransaction({
+          isProcessing: false,
+          hash: pendingHash,
+          status: 'error',
+          error: userMessage,
+          distributionSteps: ['Resumed after page reload'],
+        });
+        setStatusMessage(null);
+        notification.showError('Payment Stuck', userMessage);
+      }
+    };
+
+    resume();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, plan, loading, settingsLoading]);
+
+  // On Android MetaMask, the page may NOT fully reload — it just becomes visible again via
+  // document.visibilitychange when the user switches back from the wallet app. In that case
+  // the lateHashRef approach should still work, but if the timeout has already passed and
+  // we have a pending hash in storage, kick off verification immediately.
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') return;
+
+      const pendingHash = loadPendingTxHash();
+      if (!pendingHash || !/^0x[a-fA-F0-9]{64}$/.test(pendingHash)) return;
+
+      // Only start if we're not already processing
+      setTransaction(prev => {
+        if (prev.isProcessing) return prev;
+        // Kick off verification for the persisted hash
+        (async () => {
+          setTransaction({
+            isProcessing: true,
+            hash: pendingHash,
+            status: 'pending',
+            error: null,
+            distributionSteps: ['Resuming verification after returning from wallet...'],
+          });
+          setStatusMessage('Checking transaction on blockchain...');
+          try {
+            const result = await pollVerification(pendingHash);
+            clearPendingTxHash();
+            clearRecoveryAttempt();
+            setTransaction({
+              isProcessing: false,
+              hash: pendingHash,
+              status: 'success',
+              error: null,
+              distributionSteps: ['Payment confirmed after returning from wallet'],
+            });
+            setStatusMessage('Payment confirmed!');
+            notification.showSuccess('Payment Successful', 'Your registration payment was confirmed.');
+            const planRef = plan;
+            navigate('/registration-payment-success', {
+              state: {
+                txHash: pendingHash,
+                amount: result.amount || planRef?.tsp_price,
+                network: result.network
+              }
+            });
+            const currentUser = user;
+            if (currentUser) void fetchUserData(currentUser.id);
+          } catch (verifyError: any) {
+            clearPendingTxHash();
+            await saveRegistrationPaymentIssue(pendingHash, verifyError, ['Resumed from visibility change']);
+            const userMessage = getStuckPaymentMessage(verifyError, pendingHash);
+            setTransaction({
+              isProcessing: false,
+              hash: pendingHash,
+              status: 'error',
+              error: userMessage,
+              distributionSteps: ['Resumed from visibility change'],
+            });
+            setStatusMessage(null);
+            notification.showError('Payment Stuck', userMessage);
+          }
+        })();
+        return { ...prev, isProcessing: true };
+      });
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, plan, navigate, notification, fetchUserData]);
 
   useEffect(() => {
     if (!settings) return;
@@ -271,6 +468,21 @@ const RegistrationPayment: React.FC = () => {
       notification.showError('Unable to Add Token', error?.message || 'Please add the token manually using the contract address.');
     }
   }, [walletService, notification]);
+
+  const prepareAndroidMetaMaskToken = useCallback(async () => {
+    if (typeof navigator === 'undefined') return;
+    const isAndroid = /Android/i.test(navigator.userAgent || '');
+    const isMetaMask = String(walletState.walletName || '').toLowerCase().includes('metamask');
+    if (!isAndroid || !isMetaMask) return;
+
+    try {
+      setStatusMessage('Preparing USDT token in MetaMask...');
+      await walletService.watchUSDTToken();
+    } catch (error: any) {
+      // Non-fatal: MetaMask can still send the transfer, but may show the token as Unknown.
+      console.warn('Unable to prepare USDT token metadata before payment:', error);
+    }
+  }, [walletService, walletState.walletName]);
 
   const payNowDisabledReason = useMemo(() => {
     if (settingsLoading) return 'Loading payment settings...';
@@ -411,6 +623,9 @@ const RegistrationPayment: React.FC = () => {
   };
 
   const verifyPayment = async (txHash: string) => {
+    // Refresh the session token before each call — Android MetaMask flows can take
+    // 2+ minutes (90s timeout + 30s late hash wait), and Supabase tokens expire in 1 hour
+    // but the client may silently have an expired short-lived token.
     const session = await supabase.auth.getSession();
     const token = session.data.session?.access_token;
 
@@ -418,36 +633,489 @@ const RegistrationPayment: React.FC = () => {
       throw new Error('Missing user session');
     }
 
-    const response = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/verify-registration-payment`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ txHash })
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/verify-registration-payment`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ txHash })
+      });
+    } catch (networkError: any) {
+      // Network-level failure (no connectivity, DNS, etc.) — treat as retriable
+      return {
+        success: false,
+        status: 'pending',
+        retriable: true,
+        error: networkError?.message || 'Network error — retrying...'
+      };
+    }
 
-    return response.json();
+    let result: any;
+    try {
+      result = await response.json();
+    } catch {
+      // Unparseable response — treat as retriable server error
+      return {
+        success: false,
+        status: 'pending',
+        retriable: true,
+        error: `Server returned HTTP ${response.status} with no JSON body`
+      };
+    }
+
+    // 5xx server errors are transient — retry
+    if (response.status >= 500) {
+      return { ...result, retriable: true, status: result.status || 'pending' };
+    }
+
+    // 404 "Transaction not found on network" is transient — the node may not have
+    // propagated the tx yet (common on Android where the hash arrives quickly but
+    // the BSC node hasn't indexed it). Retry instead of failing.
+    if (response.status === 404) {
+      return { ...result, retriable: true, status: 'pending' };
+    }
+
+    // 401/403 — session problem, non-retriable
+    if (response.status === 401 || response.status === 403) {
+      return { ...result, retriable: false };
+    }
+
+    // All other cases: return the result with the http status so the caller can decide
+    return { ...result, httpStatus: response.status };
   };
 
   const pollVerification = async (txHash: string) => {
     for (let attempt = 0; attempt < PAYMENT_POLL_ATTEMPTS; attempt += 1) {
-      const result = await verifyPayment(txHash);
+      let result: any;
+      try {
+        result = await verifyPayment(txHash);
+      } catch (fetchError: any) {
+        // verifyPayment only throws for session errors — those are non-retriable
+        const error = new Error(fetchError?.message || 'Session error during payment verification');
+        (error as any).gatewayResponse = { status: 'session_error' };
+        throw error;
+      }
 
       if (result.status === 'success') {
         return result;
       }
 
-      if (result.status === 'failed') {
-        throw new Error(result.error || 'Payment failed');
+      // Retriable result — just wait and continue polling
+      if (result.retriable === true || result.status === 'pending') {
+        setStatusMessage(
+          result.message ||
+          `Payment submitted. Confirming blockchain transaction... (${attempt + 1}/${PAYMENT_POLL_ATTEMPTS})`
+        );
+        await new Promise(resolve => setTimeout(resolve, PAYMENT_POLL_INTERVAL));
+        continue;
       }
 
-      setStatusMessage(result.message || 'Waiting for confirmations...');
+      // Definitive failure: the edge function returned a clear error (wrong amount,
+      // wallet mismatch, already completed, on-chain failure, etc.).
+      // Only throw immediately for these — do NOT retry.
+      if (result.status === 'failed' || result.success === false) {
+        const error = new Error(result.error || 'Payment failed');
+        (error as any).gatewayResponse = result;
+        throw error;
+      }
+
+      // Unknown status — treat as retriable to be safe
+      setStatusMessage(
+        `Confirming payment... (${attempt + 1}/${PAYMENT_POLL_ATTEMPTS})`
+      );
       await new Promise(resolve => setTimeout(resolve, PAYMENT_POLL_INTERVAL));
     }
 
-    throw new Error('Payment confirmation timed out. Please check again later.');
+    const error = new Error('Payment confirmation timed out. Please check again later.');
+    (error as any).gatewayResponse = {
+      status: 'timeout',
+      message: 'Payment confirmation timed out',
+      attempts: PAYMENT_POLL_ATTEMPTS,
+      interval_ms: PAYMENT_POLL_INTERVAL
+    };
+    throw error;
   };
+
+  const safeSerializeGatewayResponse = (error: any, txHash: string | null, steps: string[]) => {
+    const isLivePaymentMode =
+      settings?.paymentMode === true ||
+      settings?.paymentMode === 1 ||
+      settings?.paymentMode === '1' ||
+      settings?.paymentMode === 'true';
+    const gatewayResponse = error?.gatewayResponse || error?.response?.data || error?.data || error?.info || null;
+    const rawError: Record<string, any> = {};
+
+    if (error && typeof error === 'object') {
+      [
+        'name',
+        'message',
+        'code',
+        'reason',
+        'action',
+        'shortMessage',
+        'details',
+        'method',
+        'transaction',
+        'receipt',
+        'error'
+      ].forEach((key) => {
+        if (error[key] !== undefined) rawError[key] = error[key];
+      });
+    }
+
+    const payload = {
+      blockchain: isLivePaymentMode ? 'BSC Mainnet' : 'BSC Testnet',
+      usdt_contract: settings?.usdtAddress || null,
+      admin_wallet: adminReceivingWallet || null,
+      transaction_hash: txHash,
+      wallet_address: walletState.address,
+      wallet_name: walletState.walletName,
+      chain_id: walletState.chainId,
+      processed_at: new Date().toISOString(),
+      status: txHash ? 'stuck' : 'failed',
+      error: error?.message || 'Payment failed',
+      gateway_response: gatewayResponse,
+      raw_error: rawError,
+      steps
+    };
+
+    return JSON.parse(JSON.stringify(payload, (_key, value) =>
+      typeof value === 'bigint' ? value.toString() : value
+    ));
+  };
+
+  const saveRegistrationPaymentIssue = async (
+    txHash: string | null,
+    error: any,
+    steps: string[] = []
+  ) => {
+    if (!user?.id || !plan) return null;
+
+    // User-cancelled payments (code 4001) are not stuck — they are intentional rejections
+    const isUserCancelled = error?.code === 4001;
+    const isStuck = txHash !== null && !isUserCancelled;
+
+    const errorMessage = buildUserFacingErrorMessage(error, txHash);
+    const walletErrorCode = String(error?.code ?? error?.error?.code ?? '');
+    const walletErrorRaw = buildRawWalletError(error);
+    const paymentStatus = txHash ? 'pending' : 'failed';
+    const gatewayResponse = safeSerializeGatewayResponse(error, txHash, steps);
+    const isLivePaymentMode =
+      settings?.paymentMode === true ||
+      settings?.paymentMode === 1 ||
+      settings?.paymentMode === '1' ||
+      settings?.paymentMode === 'true';
+
+    const deviceInfo = typeof navigator !== 'undefined'
+      ? navigator.userAgent.substring(0, 200)
+      : null;
+
+    const baseRecord = {
+      tp_user_id: user.id,
+      tp_subscription_id: null,
+      tp_amount: plan.tsp_price,
+      tp_currency: 'USDT',
+      tp_payment_method: 'blockchain',
+      tp_payment_status: paymentStatus,
+      tp_transaction_id: txHash,
+      tp_wallet_address: walletState.address ? walletState.address.toLowerCase() : null,
+      tp_to_address: adminReceivingWallet ? adminReceivingWallet.toLowerCase() : null,
+      tp_expected_amount: plan.tsp_price,
+      tp_network: isLivePaymentMode ? 'BSC Mainnet' : 'BSC Testnet',
+      tp_chain_id: isLivePaymentMode ? 56 : 97,
+      tp_error_message: errorMessage,
+      tp_gateway_response: gatewayResponse,
+      tp_is_stuck: isStuck,
+      tp_stuck_at: isStuck ? new Date().toISOString() : null,
+      tp_wallet_error_code: walletErrorCode || null,
+      tp_wallet_error_raw: walletErrorRaw || null,
+      tp_device_info: deviceInfo,
+    };
+
+    try {
+      if (txHash) {
+        const { data: existingPayment } = await supabase
+          .from('tbl_payments')
+          .select('tp_id, tp_user_id, tp_payment_status')
+          .eq('tp_transaction_id', txHash)
+          .maybeSingle();
+
+        if (existingPayment?.tp_id && existingPayment.tp_user_id === user.id) {
+          const alreadyCompleted = existingPayment.tp_payment_status === 'completed';
+          const { error: updateError } = await supabase
+            .from('tbl_payments')
+            .update({
+              tp_payment_status: alreadyCompleted ? 'completed' : 'pending',
+              tp_error_message: errorMessage,
+              tp_gateway_response: gatewayResponse,
+              tp_is_stuck: alreadyCompleted ? false : isStuck,
+              tp_stuck_at: alreadyCompleted ? null : (isStuck ? new Date().toISOString() : null),
+              tp_wallet_error_code: walletErrorCode || null,
+              tp_wallet_error_raw: walletErrorRaw || null,
+              tp_device_info: deviceInfo,
+            })
+            .eq('tp_id', existingPayment.tp_id);
+
+          if (updateError) throw updateError;
+          return existingPayment.tp_id;
+        }
+      }
+
+      const { data: insertedPayment, error: insertError } = await supabase
+        .from('tbl_payments')
+        .insert(baseRecord)
+        .select('tp_id')
+        .single();
+
+      if (insertError) throw insertError;
+      return insertedPayment?.tp_id || null;
+    } catch (dbError) {
+      console.error('Failed to save registration payment issue:', dbError);
+      return null;
+    }
+  };
+
+  const buildRawWalletError = (error: any): string => {
+    if (!error) return '';
+    const parts: string[] = [];
+    if (error.code !== undefined) parts.push(`Code: ${error.code}`);
+    if (error.message) parts.push(`Message: ${error.message}`);
+    if (error.reason) parts.push(`Reason: ${error.reason}`);
+    if (error.shortMessage && error.shortMessage !== error.message) parts.push(`Short: ${error.shortMessage}`);
+    if (error.data) parts.push(`Data: ${JSON.stringify(error.data)}`);
+    return parts.join(' | ').substring(0, 500);
+  };
+
+  const buildUserFacingErrorMessage = (error: any, txHash: string | null): string => {
+    const code = error?.code;
+    if (code === 4001) return 'Payment cancelled by user.';
+    if (code === -32603) return 'Internal wallet error. Please try again.';
+    if (code === 'WALLET_RESPONSE_TIMEOUT') return 'Wallet did not return a response in time. This is common on Android MetaMask.';
+    const msg = error?.shortMessage || error?.reason || error?.message || 'Payment gateway did not confirm the payment.';
+    return msg.substring(0, 300);
+  };
+
+  const getStuckPaymentMessage = (error: any, txHash: string | null) => {
+    const reason = buildUserFacingErrorMessage(error, txHash);
+    if (!txHash) return reason;
+    return reason;
+  };
+
+  const extractTransactionHash = (value: any): string | null => {
+    const candidates = [
+      value?.hash,
+      value?.transactionHash,
+      value?.txHash,
+      value?.transaction?.hash,
+      value?.receipt?.hash,
+      value?.receipt?.transactionHash,
+      value?.gatewayResponse?.txHash,
+      value?.gatewayResponse?.transaction_hash,
+      value?.gatewayResponse?.transactionHash
+    ];
+
+    return candidates.find((candidate) =>
+      typeof candidate === 'string' && /^0x[a-fA-F0-9]{64}$/.test(candidate)
+    ) || null;
+  };
+
+  const loadRecoveryAttempt = useCallback((): PaymentRecoveryAttempt | null => {
+    if (typeof window === 'undefined') return null;
+
+    try {
+      const raw = sessionStorage.getItem(PAYMENT_RECOVERY_STORAGE_KEY);
+      if (!raw) return null;
+      return JSON.parse(raw) as PaymentRecoveryAttempt;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const saveRecoveryAttempt = useCallback((attempt: PaymentRecoveryAttempt) => {
+    if (typeof window === 'undefined') return;
+    sessionStorage.setItem(PAYMENT_RECOVERY_STORAGE_KEY, JSON.stringify(attempt));
+  }, []);
+
+  const clearRecoveryAttempt = useCallback(() => {
+    if (typeof window === 'undefined') return;
+    sessionStorage.removeItem(PAYMENT_RECOVERY_STORAGE_KEY);
+  }, []);
+
+  const buildRecoveryAttempt = useCallback(async (): Promise<PaymentRecoveryAttempt | null> => {
+    if (!user?.id || !walletState.address || !plan || !adminReceivingWallet) return null;
+
+    let startBlock: number | null = null;
+    try {
+      startBlock = await walletService.getCurrentBlockNumber();
+    } catch (error) {
+      console.warn('Unable to capture payment start block:', error);
+    }
+
+    return {
+      userId: user.id,
+      walletAddress: walletState.address,
+      toAddress: adminReceivingWallet,
+      amount: plan.tsp_price,
+      chainId: walletState.chainId,
+      usdtAddress: settings?.usdtAddress || null,
+      startedAt: new Date().toISOString(),
+      startBlock
+    };
+  }, [adminReceivingWallet, plan, settings?.usdtAddress, user?.id, walletService, walletState.address, walletState.chainId]);
+
+  const findRecoverablePaymentHash = useCallback(async (attempt: PaymentRecoveryAttempt) => {
+    if (!user?.id || attempt.userId !== user.id) return null;
+    if (!walletState.address || attempt.walletAddress.toLowerCase() !== walletState.address.toLowerCase()) return null;
+    if (!adminReceivingWallet || attempt.toAddress.toLowerCase() !== adminReceivingWallet.toLowerCase()) return null;
+    if (!plan || Number(attempt.amount) !== Number(plan.tsp_price)) return null;
+
+    setStatusMessage('Checking blockchain for the submitted payment...');
+    return walletService.findRecentUSDTTransfer(
+      attempt.walletAddress,
+      attempt.toAddress,
+      attempt.amount,
+      attempt.startBlock
+    );
+  }, [adminReceivingWallet, plan, user?.id, walletService, walletState.address]);
+
+  const recoverAndVerifyPayment = useCallback(async (attempt: PaymentRecoveryAttempt, reason: string) => {
+    const recoveredHash = await findRecoverablePaymentHash(attempt);
+    if (!recoveredHash) return false;
+
+    setReverifyHash(recoveredHash);
+    setTransaction({
+      isProcessing: true,
+      hash: recoveredHash,
+      status: 'pending',
+      error: null,
+      distributionSteps: [`Recovered after ${reason}`, `Transaction found on-chain: ${recoveredHash}`]
+    });
+    setStatusMessage('Payment found on-chain. Verifying now...');
+    scrollToPaymentStatus();
+
+    try {
+      const result = await pollVerification(recoveredHash);
+      clearRecoveryAttempt();
+      clearPendingTxHash();
+      setTransaction({
+        isProcessing: false,
+        hash: recoveredHash,
+        status: 'success',
+        error: null,
+        distributionSteps: [`Recovered after ${reason}`, `Transaction found on-chain: ${recoveredHash}`]
+      });
+      setStatusMessage('Payment confirmed!');
+      notification.showSuccess('Payment Confirmed', 'Your registration payment was recovered and verified.');
+      navigate('/registration-payment-success', {
+        state: {
+          txHash: recoveredHash,
+          amount: result.amount || plan!.tsp_price,
+          network: result.network
+        }
+      });
+      void fetchUserData(user!.id);
+      return true;
+    } catch (error: any) {
+      await saveRegistrationPaymentIssue(
+        recoveredHash,
+        error,
+        [`Recovered after ${reason}`, `Transaction found on-chain: ${recoveredHash}`]
+      );
+      const userMessage = getStuckPaymentMessage(error, recoveredHash);
+      setTransaction({
+        isProcessing: false,
+        hash: recoveredHash,
+        status: 'error',
+        error: userMessage,
+        distributionSteps: [`Recovered after ${reason}`, `Transaction found on-chain: ${recoveredHash}`]
+      });
+      setStatusMessage(null);
+      notification.showError('Payment Stuck', userMessage);
+      return true;
+    }
+  }, [
+    clearRecoveryAttempt,
+    fetchUserData,
+    findRecoverablePaymentHash,
+    navigate,
+    notification,
+    plan,
+    pollVerification,
+    saveRegistrationPaymentIssue,
+    user
+  ]);
+
+  useEffect(() => {
+    if (!user?.id || !plan || !walletState.isConnected || !walletState.address) {
+      return;
+    }
+
+    const waitingForWalletResponse = transaction.isProcessing && !transaction.hash;
+    const alreadyVerifyingHash = transaction.isProcessing && !!transaction.hash;
+    if (alreadyVerifyingHash) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const tryRecovery = async (reason: string) => {
+      const attempt = loadRecoveryAttempt();
+      if (!attempt || cancelled || recoveryCheckInFlightRef.current) return;
+
+      recoveryCheckInFlightRef.current = true;
+      try {
+        const recovered = await recoverAndVerifyPayment(attempt, reason);
+        if (!recovered && !cancelled) {
+          setStatusMessage(
+            waitingForWalletResponse
+              ? 'Returned from wallet, but the transaction response was not received yet. If USDT was deducted, keep this page open while we continue checking the blockchain.'
+              : 'Previous payment not found yet. If USDT was deducted, wait a minute and tap Re-verify or contact admin with the transaction ID from MetaMask.'
+          );
+        }
+      } catch (error) {
+        console.warn('Payment recovery check failed:', error);
+      } finally {
+        recoveryCheckInFlightRef.current = false;
+      }
+    };
+
+    if (!waitingForWalletResponse) {
+      void tryRecovery('page restore');
+    }
+
+    const handleFocus = () => {
+      if (document.visibilityState && document.visibilityState !== 'visible') return;
+      void tryRecovery('wallet return');
+    };
+
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleFocus);
+    // Poll every 5s while waiting for wallet (Android may switch app context)
+    const retryIntervalId = waitingForWalletResponse
+      ? window.setInterval(() => {
+          if (document.visibilityState && document.visibilityState !== 'visible') return;
+          void tryRecovery('wallet response retry');
+        }, 5000)
+      : null;
+
+    return () => {
+      cancelled = true;
+      if (retryIntervalId) window.clearInterval(retryIntervalId);
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleFocus);
+    };
+  }, [
+    loadRecoveryAttempt,
+    plan,
+    transaction.hash,
+    transaction.isProcessing,
+    user?.id,
+    walletState.address,
+    walletState.isConnected
+  ]);
 
   const handleReverify = async (hashOverride?: string) => {
     if (!plan) {
@@ -487,8 +1155,8 @@ const RegistrationPayment: React.FC = () => {
         distributionSteps: transaction.distributionSteps || []
       });
       setStatusMessage('Payment confirmed!');
-
-      await fetchUserData(user!.id);
+      clearRecoveryAttempt();
+      clearPendingTxHash();
 
       notification.showSuccess('Payment Confirmed', 'Your registration payment was verified.');
       navigate('/registration-payment-success', {
@@ -498,16 +1166,19 @@ const RegistrationPayment: React.FC = () => {
           network: result.network
         }
       });
+      void fetchUserData(user!.id);
     } catch (error: any) {
+      await saveRegistrationPaymentIssue(targetHash, error, transaction.distributionSteps || []);
+      const userMessage = getStuckPaymentMessage(error, targetHash);
       setTransaction({
         isProcessing: false,
         hash: targetHash,
         status: 'error',
-        error: error.message || 'Verification failed',
+        error: userMessage,
         distributionSteps: transaction.distributionSteps || []
       });
       setStatusMessage(null);
-      notification.showError('Verification Failed', error.message || 'Verification failed');
+      notification.showError('Verification Stuck', userMessage);
     } finally {
       setReverifyProcessing(false);
     }
@@ -549,8 +1220,49 @@ const RegistrationPayment: React.FC = () => {
     });
     setStatusMessage('Awaiting wallet confirmation...');
 
+    let submittedHash: string | null = null;
+    let submittedSteps: string[] = [];
+    const recoveryAttempt = await buildRecoveryAttempt();
+    if (recoveryAttempt) {
+      saveRecoveryAttempt(recoveryAttempt);
+    }
+
     try {
-      const { hash, steps } = await walletService.sendUSDTTransfer(adminReceivingWallet, plan.tsp_price);
+      await prepareAndroidMetaMaskToken();
+      setStatusMessage('Awaiting wallet confirmation...');
+
+      lateHashRef.current = null;
+
+      const walletResponseTimeout = new Promise<never>((_resolve, reject) => {
+        window.setTimeout(() => {
+          const error = new Error('MetaMask did not return the transaction response after payment approval. This often happens on Android after returning from the wallet.');
+          (error as any).code = 'WALLET_RESPONSE_TIMEOUT';
+          reject(error);
+        }, PAYMENT_REQUEST_TIMEOUT_MS);
+      });
+
+      const transferPromise = walletService.sendUSDTTransfer(adminReceivingWallet, plan.tsp_price);
+
+      // Capture hash from transferPromise even if it resolves after the timeout race (Android MetaMask).
+      // Also persist it immediately to sessionStorage/localStorage so that a full page reload
+      // (which Android MetaMask sometimes causes when switching back to the DApp browser) does
+      // not lose the hash — the auto-resume effect on mount will pick it up.
+      transferPromise.then(({ hash }) => {
+        lateHashRef.current = hash;
+        savePendingTxHash(hash);
+      }).catch(() => {
+        // The raced promise handles the visible error path. This prevents an unhandled rejection
+        // if the wallet request resolves after the timeout branch has already started recovery.
+      });
+
+      const { hash, steps } = await Promise.race([
+        transferPromise,
+        walletResponseTimeout
+      ]);
+      submittedHash = hash;
+      submittedSteps = steps;
+      // Persist immediately in the normal (non-timeout) path too
+      savePendingTxHash(hash);
 
       setTransaction({
         isProcessing: true,
@@ -559,10 +1271,13 @@ const RegistrationPayment: React.FC = () => {
         error: null,
         distributionSteps: steps
       });
-      setStatusMessage('Transaction submitted. Waiting for confirmations...');
+      setStatusMessage('Payment sent from wallet. Confirming blockchain payment and activating your account...');
+      scrollToPaymentStatus();
 
       const result = await pollVerification(hash);
 
+      clearPendingTxHash();
+      clearRecoveryAttempt();
       setTransaction({
         isProcessing: false,
         hash,
@@ -572,8 +1287,8 @@ const RegistrationPayment: React.FC = () => {
       });
       setStatusMessage('Payment confirmed!');
 
-      await fetchUserData(user!.id);
-
+      // Navigate BEFORE fetchUserData so the component unmounts before the auth state
+      // update can trigger the dashboard-redirect useEffect.
       notification.showSuccess('Payment Successful', 'Your registration payment was confirmed.');
       navigate('/registration-payment-success', {
         state: {
@@ -582,16 +1297,111 @@ const RegistrationPayment: React.FC = () => {
           network: result.network
         }
       });
+      // Fire-and-forget: update auth state in the background after navigation
+      void fetchUserData(user!.id);
     } catch (error: any) {
+      // On Android MetaMask, the transferPromise may resolve with the hash AFTER the
+      // timeout race. Give it up to 30 seconds to arrive before falling back to
+      // blockchain log search.
+      if (error?.code === 'WALLET_RESPONSE_TIMEOUT' && !submittedHash) {
+        setStatusMessage('Wallet response delayed. Waiting for transaction confirmation from MetaMask...');
+
+        const lateHashWait = await new Promise<string | null>((resolve) => {
+          const maxWait = 30000;
+          const checkInterval = 1000;
+          let elapsed = 0;
+          const interval = window.setInterval(() => {
+            elapsed += checkInterval;
+            if (lateHashRef.current) {
+              window.clearInterval(interval);
+              resolve(lateHashRef.current);
+            } else if (elapsed >= maxWait) {
+              window.clearInterval(interval);
+              resolve(null);
+            }
+          }, checkInterval);
+        });
+
+        if (lateHashWait) {
+          submittedHash = lateHashWait;
+          submittedSteps = ['Transaction hash recovered from delayed MetaMask response (Android)'];
+          savePendingTxHash(lateHashWait);
+          setTransaction({
+            isProcessing: true,
+            hash: lateHashWait,
+            status: 'pending',
+            error: null,
+            distributionSteps: submittedSteps
+          });
+          setStatusMessage('Payment confirmed by wallet. Verifying on blockchain...');
+          scrollToPaymentStatus();
+
+          try {
+            const result = await pollVerification(lateHashWait);
+            clearPendingTxHash();
+            clearRecoveryAttempt();
+            setTransaction({
+              isProcessing: false,
+              hash: lateHashWait,
+              status: 'success',
+              error: null,
+              distributionSteps: submittedSteps
+            });
+            setStatusMessage('Payment confirmed!');
+            notification.showSuccess('Payment Successful', 'Your registration payment was confirmed.');
+            navigate('/registration-payment-success', {
+              state: {
+                txHash: lateHashWait,
+                amount: result.amount || plan.tsp_price,
+                network: result.network
+              }
+            });
+            void fetchUserData(user!.id);
+            return;
+          } catch (verifyError: any) {
+            clearPendingTxHash();
+            await saveRegistrationPaymentIssue(lateHashWait, verifyError, submittedSteps);
+            const userMessage = getStuckPaymentMessage(verifyError, lateHashWait);
+            setTransaction({
+              isProcessing: false,
+              hash: lateHashWait,
+              status: 'error',
+              error: userMessage,
+              distributionSteps: submittedSteps
+            });
+            setStatusMessage(null);
+            notification.showError('Payment Stuck', userMessage);
+            return;
+          }
+        }
+      }
+
+      const txHash = submittedHash || extractTransactionHash(error) || transaction.hash || null;
+      const steps = submittedSteps.length > 0 ? submittedSteps : transaction.distributionSteps;
+
+      if (!txHash && error?.code !== 4001 && recoveryAttempt) {
+        setStatusMessage('Checking blockchain for your payment...');
+        const recovered = await recoverAndVerifyPayment(recoveryAttempt, 'wallet response issue');
+        if (recovered) return;
+      }
+
+      if (error?.code === 4001) {
+        clearPendingTxHash();
+        clearRecoveryAttempt();
+      }
+
+      await saveRegistrationPaymentIssue(txHash, error, steps || []);
+      const userMessage = getStuckPaymentMessage(error, txHash);
+
       setTransaction({
         isProcessing: false,
-        hash: transaction.hash,
+        hash: txHash,
         status: 'error',
-        error: error.message || 'Payment failed',
-        distributionSteps: transaction.distributionSteps
+        error: userMessage,
+        distributionSteps: steps || []
       });
       setStatusMessage(null);
-      notification.showError('Payment Failed', error.message || 'Payment failed');
+      notification.showError(txHash ? 'Payment Stuck' : 'Payment Failed', userMessage);
     }
   };
 
@@ -607,6 +1417,40 @@ const RegistrationPayment: React.FC = () => {
       : `https://testnet.bscscan.com/tx/${transaction.hash}`;
     window.open(explorerUrl, '_blank', 'noopener,noreferrer');
   };
+
+  const scrollToPaymentStatus = () => {
+    if (typeof window === 'undefined') return;
+    window.setTimeout(() => {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }, 100);
+  };
+
+  const paymentStatusTitle = useMemo(() => {
+    if (transaction.status === 'pending' && transaction.hash) return 'Payment sent. Activating your account...';
+    if (transaction.status === 'pending') return 'Waiting for wallet confirmation...';
+    if (transaction.status === 'success') return 'Payment confirmed';
+    if (transaction.status === 'error') return transaction.hash ? 'Payment needs verification' : 'Payment failed';
+    return null;
+  }, [transaction.hash, transaction.status]);
+
+  const paymentStatusDescription = useMemo(() => {
+    if (transaction.status === 'pending' && transaction.hash) {
+      return 'Your USDT transaction was submitted successfully. Please stay on this page while we confirm it on-chain and activate your account.';
+    }
+    if (transaction.status === 'pending') {
+      return 'Please approve the payment in your wallet. If the wallet already deducted USDT, we will try to recover and verify the transaction automatically.';
+    }
+    if (transaction.status === 'success') {
+      return 'Your registration payment has been confirmed.';
+    }
+    if (transaction.status === 'error' && transaction.hash) {
+      return 'The payment was found but activation could not finish automatically. Share this transaction ID with admin for manual verification.';
+    }
+    if (transaction.status === 'error') {
+      return 'The payment could not be completed. If USDT was deducted, provide the transaction ID from your wallet to admin.';
+    }
+    return null;
+  }, [transaction.hash, transaction.status]);
 
   if (loading) {
     return (
@@ -636,6 +1480,53 @@ const RegistrationPayment: React.FC = () => {
           <h1 className="text-3xl font-bold text-gray-900 mb-2">Registration Payment</h1>
           <p className="text-gray-600">Connect your wallet and pay the registration fee to activate your account.</p>
         </div>
+
+        {transaction.status !== 'idle' && paymentStatusTitle && (
+          <div className={`rounded-2xl border p-4 sm:p-5 shadow-sm ${
+            transaction.status === 'success'
+              ? 'bg-green-50 border-green-200'
+              : transaction.status === 'error'
+                ? 'bg-red-50 border-red-200'
+                : 'bg-blue-50 border-blue-200'
+          }`}>
+            <div className="flex items-start gap-3">
+              <div className={`mt-0.5 flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full ${
+                transaction.status === 'success'
+                  ? 'bg-green-100 text-green-700'
+                  : transaction.status === 'error'
+                    ? 'bg-red-100 text-red-700'
+                    : 'bg-blue-100 text-blue-700'
+              }`}>
+                {transaction.status === 'pending' && <Loader className="h-5 w-5 animate-spin" />}
+                {transaction.status === 'success' && <CheckCircle className="h-5 w-5" />}
+                {transaction.status === 'error' && <XCircle className="h-5 w-5" />}
+              </div>
+              <div className="min-w-0 flex-1">
+                <h2 className="text-base sm:text-lg font-semibold text-gray-900">{paymentStatusTitle}</h2>
+                {paymentStatusDescription && (
+                  <p className="mt-1 text-sm text-gray-700">{paymentStatusDescription}</p>
+                )}
+                {statusMessage && (
+                  <p className="mt-2 text-sm font-medium text-gray-900">{statusMessage}</p>
+                )}
+                {transaction.hash && (
+                  <div className="transaction-hash-container mt-3 flex flex-col gap-2 sm:flex-row sm:items-center">
+                    <code className="transaction-hash-code min-w-0 flex-1 overflow-x-auto scrollbar-hide whitespace-nowrap rounded-lg border border-gray-200 bg-white/80 px-3 py-2 font-mono text-xs text-gray-900">
+                      {transaction.hash}
+                    </code>
+                    <button
+                      onClick={openTransaction}
+                      className="transaction-hash-button inline-flex items-center justify-center gap-2 rounded-lg border border-blue-200 bg-white px-3 py-2 text-sm font-medium text-blue-700 hover:bg-blue-50"
+                    >
+                      <ExternalLink className="h-4 w-4" />
+                      <span>View Tx</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
           <div className="lg:col-span-2 space-y-6">
@@ -718,63 +1609,152 @@ const RegistrationPayment: React.FC = () => {
             </div>
 
             {transaction.status !== 'idle' && (
-              <div className="bg-white rounded-xl shadow-md p-6">
-                <h2 className="text-xl font-semibold text-gray-900 mb-4">Payment Status</h2>
-
-                <div className="flex items-center space-x-3 mb-4">
-                  {transaction.status === 'pending' && <Loader className="h-5 w-5 text-yellow-500 animate-spin" />}
-                  {transaction.status === 'success' && <CheckCircle className="h-5 w-5 text-green-600" />}
-                  {transaction.status === 'error' && <XCircle className="h-5 w-5 text-red-500" />}
-                  <span className="text-sm font-medium text-gray-700">
-                    {transaction.status === 'pending' && 'Payment Pending'}
+              <div className={`rounded-xl shadow-md p-6 border-2 ${
+                transaction.status === 'success'
+                  ? 'bg-green-50 border-green-200'
+                  : transaction.status === 'error'
+                    ? transaction.hash ? 'bg-amber-50 border-amber-300' : 'bg-red-50 border-red-200'
+                    : 'bg-blue-50 border-blue-200'
+              }`}>
+                {/* Status header */}
+                <div className="flex items-center gap-3 mb-4">
+                  {transaction.status === 'pending' && <Loader className="h-6 w-6 text-blue-600 animate-spin flex-shrink-0" />}
+                  {transaction.status === 'success' && <CheckCircle className="h-6 w-6 text-green-600 flex-shrink-0" />}
+                  {transaction.status === 'error' && transaction.hash && <XCircle className="h-6 w-6 text-amber-600 flex-shrink-0" />}
+                  {transaction.status === 'error' && !transaction.hash && <XCircle className="h-6 w-6 text-red-500 flex-shrink-0" />}
+                  <h2 className={`text-lg font-bold ${
+                    transaction.status === 'success' ? 'text-green-800'
+                    : transaction.status === 'error' && transaction.hash ? 'text-amber-800'
+                    : transaction.status === 'error' ? 'text-red-800'
+                    : 'text-blue-800'
+                  }`}>
+                    {transaction.status === 'pending' && 'Processing Payment...'}
                     {transaction.status === 'success' && 'Payment Confirmed'}
-                    {transaction.status === 'error' && 'Payment Failed'}
-                  </span>
+                    {transaction.status === 'error' && transaction.hash && 'Payment Stuck — Action Required'}
+                    {transaction.status === 'error' && !transaction.hash && 'Payment Failed'}
+                  </h2>
                 </div>
 
                 {statusMessage && (
-                  <p className="text-sm text-gray-600 mb-4">{statusMessage}</p>
+                  <p className="text-sm text-gray-700 mb-4 leading-relaxed">{statusMessage}</p>
                 )}
 
-                {transaction.hash && (
-                  <div className="flex items-center space-x-2 text-sm">
-                    <code className="flex-1 px-3 py-2 bg-gray-50 text-gray-900 rounded border border-gray-200 font-mono">
+                {/* Stuck payment: full information panel */}
+                {transaction.status === 'error' && transaction.hash && (
+                  <div className="space-y-4">
+                    {/* Error reason */}
+                    {transaction.error && (
+                      <div className="rounded-lg border border-amber-200 bg-white p-4">
+                        <p className="text-xs font-semibold text-amber-700 uppercase tracking-wide mb-1">Wallet Error</p>
+                        <p className="text-sm text-gray-800 leading-relaxed">{transaction.error}</p>
+                      </div>
+                    )}
+
+                    {/* Transaction ID — the most important thing to save */}
+                    <div className="rounded-lg border border-gray-200 bg-white p-4">
+                      <div className="flex items-center justify-between mb-2">
+                        <p className="text-xs font-semibold text-gray-600 uppercase tracking-wide">Transaction ID (Save This)</p>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => void copyToClipboard(transaction.hash!)}
+                            className="inline-flex items-center gap-1.5 rounded border border-gray-200 bg-gray-50 px-2 py-1 text-xs font-medium text-gray-700 hover:bg-gray-100"
+                            title="Copy transaction hash"
+                          >
+                            <Copy className="h-3 w-3" />
+                            Copy
+                          </button>
+                          <button
+                            onClick={openTransaction}
+                            className="inline-flex items-center gap-1.5 rounded border border-blue-200 bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700 hover:bg-blue-100"
+                          >
+                            <ExternalLink className="h-3 w-3" />
+                            View on Chain
+                          </button>
+                        </div>
+                      </div>
+                      <code className="transaction-hash-code block w-full overflow-x-auto scrollbar-hide whitespace-nowrap rounded bg-gray-50 px-3 py-2 font-mono text-xs text-gray-900 border border-gray-100">
+                        {transaction.hash}
+                      </code>
+                    </div>
+
+                    {/* What to do next */}
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
+                      <p className="text-sm font-semibold text-amber-900 mb-2">What to do:</p>
+                      <ol className="text-sm text-amber-800 space-y-1.5 list-decimal list-inside">
+                        <li>First, try <strong>Re-verify</strong> below — our system will check the blockchain again.</li>
+                        <li>If that fails, <strong>copy the Transaction ID above</strong> and contact admin.</li>
+                        <li>Admin will verify the transaction manually and activate your account.</li>
+                      </ol>
+                    </div>
+
+                    {/* Re-verify controls */}
+                    <div className="space-y-2">
+                      <p className="text-xs font-medium text-gray-600">Re-verify this payment on the blockchain:</p>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          value={reverifyHash}
+                          onChange={(event) => setReverifyHash(event.target.value)}
+                          placeholder={transaction.hash}
+                          className="flex-1 rounded border border-gray-200 bg-white px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-200"
+                        />
+                        <button
+                          onClick={() => handleReverify()}
+                          disabled={reverifyProcessing || transaction.isProcessing || (!reverifyHash && !transaction.hash)}
+                          className="flex-shrink-0 rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+                        >
+                          {reverifyProcessing ? 'Checking...' : 'Re-verify'}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Failed payment (no hash) */}
+                {transaction.status === 'error' && !transaction.hash && (
+                  <div className="space-y-3">
+                    {transaction.error && (
+                      <div className="rounded-lg border border-red-200 bg-white p-4">
+                        <p className="text-xs font-semibold text-red-700 uppercase tracking-wide mb-1">Reason</p>
+                        <p className="text-sm text-gray-800">{transaction.error}</p>
+                      </div>
+                    )}
+                    <p className="text-sm text-gray-600">
+                      If USDT was deducted from your wallet, enter your transaction hash below and click Re-verify, or contact admin.
+                    </p>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        value={reverifyHash}
+                        onChange={(event) => setReverifyHash(event.target.value)}
+                        placeholder="Paste transaction hash: 0x..."
+                        className="flex-1 rounded border border-gray-200 bg-white px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-200"
+                      />
+                      <button
+                        onClick={() => handleReverify()}
+                        disabled={reverifyProcessing || transaction.isProcessing || !reverifyHash}
+                        className="flex-shrink-0 rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+                      >
+                        {reverifyProcessing ? 'Checking...' : 'Re-verify'}
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Pending: show hash if available */}
+                {transaction.status === 'pending' && transaction.hash && (
+                  <div className="transaction-hash-container flex items-center gap-2">
+                    <code className="transaction-hash-code min-w-0 flex-1 overflow-x-auto scrollbar-hide whitespace-nowrap rounded border border-blue-200 bg-white px-3 py-2 font-mono text-xs text-gray-900">
                       {transaction.hash}
                     </code>
                     <button
                       onClick={openTransaction}
-                      className="p-2 bg-blue-100 hover:bg-blue-200 text-blue-700 rounded transition-colors border border-blue-200"
+                      className="transaction-hash-button flex-shrink-0 rounded border border-blue-200 bg-white p-2 text-blue-700 hover:bg-blue-50"
                       title="View on explorer"
                     >
-                      <ExternalLink className="w-4 h-4" />
+                      <ExternalLink className="h-4 w-4" />
                     </button>
                   </div>
-                )}
-
-                <div className="mt-4 space-y-2">
-                  <p className="text-xs text-gray-500">
-                    Re-verify using the same wallet that made the payment.
-                  </p>
-                  <div className="flex items-center space-x-2">
-                    <input
-                      type="text"
-                      value={reverifyHash}
-                      onChange={(event) => setReverifyHash(event.target.value)}
-                      placeholder={transaction.hash || '0x...'}
-                      className="flex-1 px-3 py-2 text-sm rounded border border-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-200"
-                    />
-                    <button
-                      onClick={() => handleReverify()}
-                      disabled={reverifyProcessing || transaction.isProcessing || (!reverifyHash && !transaction.hash)}
-                      className="px-3 py-2 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
-                    >
-                      {reverifyProcessing ? 'Checking...' : 'Re-verify'}
-                    </button>
-                  </div>
-                </div>
-
-                {transaction.error && (
-                  <p className="text-sm text-red-600 mt-4">{transaction.error}</p>
                 )}
               </div>
             )}
